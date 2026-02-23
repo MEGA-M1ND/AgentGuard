@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: agentguard-postgres
+    environment:
+      POSTGRES_USER: agentguard
+      POSTGRES_PASSWORD: agentguard_password
+      POSTGRES_DB: agentguard
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentguard"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: agentguard-backend
+    environment:
+      DATABASE_URL: postgresql://agentguard:agentguard_password@postgres:5432/agentguard
+      ADMIN_API_KEY: admin-secret-key-change-in-production
+      HOST: 0.0.0.0
+      PORT: 8000
+      LOG_LEVEL: INFO
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: agentguard-ui
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    volumes:
+      - ./ui:/app
+      - /app/node_modules
+      - /app/.next
+
+volumes:
+  postgres_data:
