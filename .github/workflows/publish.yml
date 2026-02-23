@@ -1,0 +1,36 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]   # triggers when you create a GitHub Release
+
+jobs:
+  build-and-publish:
+    name: Build and publish SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk   # all steps run inside the sdk/ folder
+
+    permissions:
+      id-token: write   # required for trusted publishing (no API token needed)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/dist/
