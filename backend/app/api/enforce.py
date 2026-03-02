@@ -1,5 +1,6 @@
 """Policy enforcement endpoint"""
 import fnmatch
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -7,9 +8,12 @@ from sqlalchemy.orm import Session
 from app.api.deps import require_agent
 from app.database import get_db
 from app.models.agent import Agent
+from app.models.approval import ApprovalRequest
 from app.models.policy import Policy
+from app.models.team_policy import TeamPolicy
 from app.schemas.policy import EnforceRequest, EnforceResponse
 from app.utils.logger import logger
+from app.utils.webhook import send_webhook
 
 router = APIRouter(prefix="/enforce", tags=["enforcement"])
 
@@ -28,119 +32,166 @@ def normalize_action(action: str) -> str:
     - Mixed: "Read-File" → "read:file"
     - Single word: "read" → "read" (for wildcard matching)
     - Wildcards preserved: "delete *" → "delete:*"
-
-    Examples:
-    - "read file" → "read:file"
-    - "Read File" → "read:file"
-    - "readFile" → "read:file"
-    - "read-file" → "read:file"
-    - "read_file" → "read:file"
-    - "send email" → "send:email"
-    - "query database" → "query:database"
-    - "delete *" → "delete:*"
-    - "read" → "read"
     """
     import re
 
-    # Strip whitespace first
     action = action.strip()
 
-    # If already in correct format (verb:noun), just lowercase and return
     if ":" in action:
         return action.lower()
 
-    # Handle CamelCase BEFORE lowercasing by inserting space before capitals
-    # e.g., "readFile" → "read File"
     action = re.sub(r'([a-z])([A-Z])', r'\1 \2', action)
-
-    # Now lowercase everything
     action = action.lower()
-
-    # Replace hyphens and underscores with spaces
-    # e.g., "read-file" → "read file", "read_file" → "read file"
     action = action.replace("-", " ").replace("_", " ")
 
-    # Split by whitespace and filter empty strings
     parts = [p for p in action.split() if p]
 
-    # If single word, return as-is (for simple actions or wildcards)
     if len(parts) == 1:
         return parts[0]
 
-    # If two or more words, join first two with colon
-    # e.g., ["read", "file", "system"] → "read:file"
-    # This handles cases like "send email notification" → "send:email"
     verb = parts[0]
     noun = parts[1]
 
     return f"{verb}:{noun}"
 
 
-def matches_rule(action: str, resource: str, rule_action: str, rule_resource: str) -> bool:
+def matches_rule(action: str, resource: str, rule: dict, agent: Agent) -> bool:
     """
-    Check if action/resource matches a policy rule
+    Check if action/resource matches a policy rule, including optional conditions.
 
-    Case-insensitive matching with wildcards and flexible patterns:
-    - "read" matches "read:*" (simple action matches pattern)
-    - "Read:File" matches "read:*" (case-insensitive)
-    - "READ" matches "read" (exact match, case-insensitive)
-    - resource: "s3://bucket/*" matches any resource in bucket
+    Performs action/resource glob matching then evaluates any ``conditions`` block
+    (env, time_range, day_of_week) via :func:`app.utils.conditions.evaluate_conditions`.
+    Returns True only when *both* the action/resource pattern *and* all conditions pass.
     """
-    # Normalize both action and rule to lowercase for case-insensitive comparison
+    from app.utils.conditions import evaluate_conditions
+
+    rule_action = rule.get("action", "")
+    rule_resource = rule.get("resource", "*")
+
     normalized_action = normalize_action(action)
     normalized_rule = normalize_action(rule_action)
 
-    # Direct match with wildcards
+    matched = False
     if fnmatch.fnmatch(normalized_action, normalized_rule):
-        # Check resource if rule has resource constraint
         if not rule_resource or rule_resource == "*":
-            return True
-        return fnmatch.fnmatch(resource.lower() if resource else "", rule_resource.lower())
-
-    # If action is simple (no colon) and rule has pattern (has colon), try matching base verb
-    # e.g., "read" should match "read:*"
-    if ":" not in normalized_action and ":" in normalized_rule:
+            matched = True
+        else:
+            matched = fnmatch.fnmatch(resource.lower() if resource else "", rule_resource.lower())
+    elif ":" not in normalized_action and ":" in normalized_rule:
         rule_verb = normalized_rule.split(":")[0]
         if normalized_action == rule_verb or fnmatch.fnmatch(normalized_action, rule_verb):
-            # Check resource constraint
             if not rule_resource or rule_resource == "*":
-                return True
-            return fnmatch.fnmatch(resource.lower() if resource else "", rule_resource.lower())
+                matched = True
+            else:
+                matched = fnmatch.fnmatch(resource.lower() if resource else "", rule_resource.lower())
 
-    return False
+    if not matched:
+        return False
+
+    return evaluate_conditions(rule.get("conditions") or {}, agent, None)
 
 
-def enforce_policy(agent_id: str, action: str, resource: str, db: Session) -> tuple[bool, str]:
+def enforce_policy(
+    agent_id: str,
+    action: str,
+    resource: str,
+    context: Optional[Dict[str, Any]],
+    db: Session,
+    agent: Optional[Agent] = None,
+) -> tuple[str, str, Optional[str]]:
     """
-    Enforce policy for an agent action
+    Enforce policy for an agent action.
 
     Returns:
-        Tuple of (allowed: bool, reason: str)
+        Tuple of (status: str, reason: str, approval_id: Optional[str])
+        status is one of: "allowed", "denied", "pending"
 
-    Policy logic:
+    Policy logic (priority order):
     1. If no policy exists, deny by default
-    2. Check deny rules first - if matched, deny
-    3. Check allow rules - if matched, allow
-    4. If no rules match, deny by default
+    2. Check require_approval rules first — if matched, create approval request and return pending
+    3. Check deny rules — if matched, deny
+    4. Check allow rules — if matched, allow
+    5. Default: deny-list mode if no allow rules configured (allow anything not denied);
+               allow-list mode if allow rules present (deny anything not explicitly allowed)
     """
-    # Get policy
     policy = db.query(Policy).filter(Policy.agent_id == agent_id).first()
 
     if not policy:
-        return False, "No policy defined for agent (default deny)"
+        return "denied", "No policy defined for agent (default deny)", None
 
-    # Check deny rules first
-    for rule in policy.deny_rules:
-        if matches_rule(action, resource or "", rule.get("action", ""), rule.get("resource", "*")):
-            return False, f"Denied by rule: {rule.get('action')} on {rule.get('resource', '*')}"
+    # Resolve the Agent object — needed for condition evaluation, team policy lookup, and webhook payload.
+    # The caller may pass it directly to avoid a second DB round-trip.
+    if agent is None:
+        agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
 
-    # Check allow rules
-    for rule in policy.allow_rules:
-        if matches_rule(action, resource or "", rule.get("action", ""), rule.get("resource", "*")):
-            return True, f"Allowed by rule: {rule.get('action')} on {rule.get('resource', '*')}"
+    # ------------------------------------------------------------------
+    # Team policy merge
+    # ------------------------------------------------------------------
+    # If the agent's owner_team has a TeamPolicy, merge its rules with the
+    # agent's own policy.  Merge semantics:
+    #   - deny:             team deny goes FIRST  (team can block agent allow)
+    #   - allow:            agent allow goes FIRST (agent can narrow team allow)
+    #   - require_approval: agent rules first, team rules appended
+    # ------------------------------------------------------------------
+    team_policy = None
+    if agent and agent.owner_team:
+        team_policy = db.query(TeamPolicy).filter(TeamPolicy.team == agent.owner_team).first()
 
-    # Default deny
-    return False, "No matching allow rule (default deny)"
+    if team_policy:
+        merged_require_approval = (
+            (getattr(policy, "require_approval_rules", None) or []) +
+            (team_policy.require_approval_rules or [])
+        )
+        merged_deny = (team_policy.deny_rules or []) + (policy.deny_rules or [])
+        merged_allow = (policy.allow_rules or []) + (team_policy.allow_rules or [])
+    else:
+        merged_require_approval = getattr(policy, "require_approval_rules", None) or []
+        merged_deny = policy.deny_rules or []
+        merged_allow = policy.allow_rules or []
+
+    # 1. Check require_approval rules first
+    for rule in merged_require_approval:
+        if matches_rule(action, resource or "", rule, agent):
+            # Create an ApprovalRequest record
+            approval = ApprovalRequest(
+                agent_id=agent_id,
+                action=action,
+                resource=resource or None,
+                context=context,
+            )
+            db.add(approval)
+            db.commit()
+            db.refresh(approval)
+
+            # Fire webhook notification (non-blocking)
+            send_webhook("approval.created", {
+                "approval_id": approval.approval_id,
+                "agent_id": agent_id,
+                "agent_name": agent.name if agent else None,
+                "action": action,
+                "resource": resource or None,
+                "context": context,
+            })
+
+            reason = f"Requires human approval: {rule.get('action')} on {rule.get('resource', '*')}"
+            return "pending", reason, approval.approval_id
+
+    # 2. Check deny rules
+    for rule in merged_deny:
+        if matches_rule(action, resource or "", rule, agent):
+            return "denied", f"Denied by rule: {rule.get('action')} on {rule.get('resource', '*')}", None
+
+    # 3. Check allow rules
+    for rule in merged_allow:
+        if matches_rule(action, resource or "", rule, agent):
+            return "allowed", f"Allowed by rule: {rule.get('action')} on {rule.get('resource', '*')}", None
+
+    # 4. Default: mode depends on whether allow rules are configured.
+    #    - Allow-list mode (allow rules present): deny anything not explicitly allowed.
+    #    - Deny-list mode (no allow rules): allow anything not explicitly denied.
+    if merged_allow:
+        return "denied", "No matching allow rule (default deny)", None
+    return "allowed", "No deny rule matched (default allow — deny-list mode)", None
 
 
 @router.post("", response_model=EnforceResponse)
@@ -150,28 +201,74 @@ def enforce(
     db: Session = Depends(get_db)
 ):
     """
-    Check if agent is allowed to perform an action (Agent auth)
+    Check if agent is allowed to perform an action (Agent auth).
 
-    Returns whether action is allowed and explanation
+    Returns status: 'allowed', 'denied', or 'pending'.
+    When status='pending', poll GET /approvals/{approval_id} until decision is made.
     """
-    allowed, reason = enforce_policy(
+    action_status, reason, approval_id = enforce_policy(
         agent_id=agent.agent_id,
         action=request.action,
         resource=request.resource or "",
-        db=db
+        context=request.context,
+        db=db,
+        agent=agent,
     )
 
+    allowed = action_status == "allowed"
+
     logger.info(
-        f"Enforcement check: {agent.agent_id} - {request.action} - {'allowed' if allowed else 'denied'}",
+        f"Enforcement check: {agent.agent_id} - {request.action} - {action_status}",
         extra={
             "agent_id": agent.agent_id,
             "action": request.action,
             "resource": request.resource,
-            "allowed": allowed
+            "allowed": allowed,
+            "status": action_status,
+            "approval_id": approval_id,
         }
     )
 
-    return EnforceResponse(allowed=allowed, reason=reason)
+    return EnforceResponse(
+        allowed=allowed,
+        status=action_status,
+        reason=reason,
+        approval_id=approval_id,
+    )
+
+
+@router.get("/approval/{approval_id}")
+def get_own_approval_status(
+    approval_id: str,
+    agent: Agent = Depends(require_agent),
+    db: Session = Depends(get_db),
+):
+    """
+    Poll approval status for an approval created by this agent (Agent auth).
+
+    Agents can only view approvals they created — no admin credentials required.
+    Returns status ('pending', 'approved', 'denied') and decision details once
+    a human has acted on the request.
+    """
+    approval = db.query(ApprovalRequest).filter(
+        ApprovalRequest.approval_id == approval_id,
+        ApprovalRequest.agent_id == agent.agent_id,
+    ).first()
+
+    if not approval:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Approval {approval_id} not found for this agent",
+        )
+
+    return {
+        "approval_id": approval.approval_id,
+        "status": approval.status,
+        "decision_reason": approval.decision_reason,
+        "decision_by": approval.decision_by,
+        "decision_at": approval.decision_at.isoformat() if approval.decision_at else None,
+    }
 
 
 def enforce_or_raise(
@@ -181,14 +278,14 @@ def enforce_or_raise(
     db: Session
 ) -> None:
     """
-    Helper function to enforce policy and raise exception if denied
+    Helper function to enforce policy and raise exception if denied.
 
     Raises:
-        HTTPException: If action is not allowed
+        HTTPException: If action is not allowed or pending
     """
-    allowed, reason = enforce_policy(agent_id, action, resource, db)
+    action_status, reason, _ = enforce_policy(agent_id, action, resource, None, db)
 
-    if not allowed:
+    if action_status != "allowed":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Action not allowed: {reason}"

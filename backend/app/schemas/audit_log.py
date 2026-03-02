@@ -31,6 +31,7 @@ class AuditLogResponse(BaseModel):
     result: str
     metadata: Optional[Dict[str, Any]] = None
     request_id: Optional[Union[UUID, str]]
+    previous_hash: str = ""
 
     class Config:
         from_attributes = True
@@ -38,7 +39,7 @@ class AuditLogResponse(BaseModel):
     @model_validator(mode='before')
     @classmethod
     def map_log_metadata(cls, data):
-        """Map log_metadata attribute to metadata field"""
+        """Map log_metadata attribute to metadata field and include previous_hash"""
         # Handle SQLAlchemy model objects
         if hasattr(data, '__dict__') and hasattr(data, 'log_metadata'):
             return {
@@ -51,6 +52,19 @@ class AuditLogResponse(BaseModel):
                 'allowed': data.allowed,
                 'result': data.result,
                 'metadata': data.log_metadata,
-                'request_id': data.request_id
+                'request_id': data.request_id,
+                'previous_hash': getattr(data, 'previous_hash', ''),
             }
         return data
+
+
+class ChainVerifyResponse(BaseModel):
+    """Response from GET /logs/verify — reports chain integrity for an agent's audit log"""
+
+    agent_id: str
+    valid: bool = Field(..., description="True if the entire chain is intact")
+    total_entries: int = Field(..., description="Total number of log entries checked")
+    broken_at: Optional[str] = Field(
+        None,
+        description="log_id of the first entry whose hash does not match — null when valid=true",
+    )

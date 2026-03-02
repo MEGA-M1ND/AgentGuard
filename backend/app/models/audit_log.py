@@ -29,6 +29,7 @@ class AuditLog(Base):
     result = Column(String(50), nullable=False)  # success, error
     log_metadata = Column("metadata", JSON, nullable=True)  # Column name is 'metadata', attribute is 'log_metadata'
     request_id = Column(String(36), nullable=True)
+    previous_hash = Column(String(64), nullable=False, default="")  # SHA-256 chain link
 
     # Relationships
     agent = relationship("Agent", back_populates="logs")

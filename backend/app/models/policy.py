@@ -14,8 +14,9 @@ class Policy(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     agent_id = Column(String(50), ForeignKey("agents.agent_id", ondelete="CASCADE"), unique=True, nullable=False)
-    allow_rules = Column(JSON, default=list, nullable=False)  # List of {action, resource} dicts
-    deny_rules = Column(JSON, default=list, nullable=False)   # List of {action, resource} dicts
+    allow_rules = Column(JSON, default=list, nullable=False)              # List of {action, resource} dicts
+    deny_rules = Column(JSON, default=list, nullable=False)               # List of {action, resource} dicts
+    require_approval_rules = Column(JSON, default=list, nullable=False)   # List of {action, resource} dicts
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

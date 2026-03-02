@@ -6,9 +6,10 @@ from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from prometheus_fastapi_instrumentator import Instrumentator
 
-from app.api import agents, enforce, logs, policies, health
+from app.api import admin, agents, approvals, enforce, logs, playground, policies, health, reports, tokens
 from app.config import settings
 from app.utils.logger import logger, setup_logging
+from app.utils.jwt_utils import get_private_key  # warm up keypair on startup
 
 # Setup logging
 setup_logging(settings.LOG_LEVEL)
@@ -17,7 +18,8 @@ setup_logging(settings.LOG_LEVEL)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler"""
-    # Startup
+    # Startup — warm up JWT keypair so the warning is emitted early
+    get_private_key()
     logger.info("AgentGuard backend starting up", extra={
         "version": "0.1.0",
         "environment": settings.HOST,
@@ -97,11 +99,17 @@ if settings.RATE_LIMIT_ENABLED:
 # ===== Route Setup =====
 
 # Include routers
+app.include_router(tokens.router)
 app.include_router(health.router)
 app.include_router(agents.router)
 app.include_router(policies.router)
+app.include_router(policies.templates_router)
 app.include_router(enforce.router)
 app.include_router(logs.router)
+app.include_router(approvals.router)
+app.include_router(reports.router)
+app.include_router(admin.router)
+app.include_router(playground.router)
 
 
 @app.get("/")

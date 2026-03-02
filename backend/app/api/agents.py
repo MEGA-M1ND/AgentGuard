@@ -4,7 +4,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import require_admin
+from app.api.deps import AdminContext, get_admin_context, require_admin
 from app.database import get_db
 from app.models.agent import Agent, AgentKey
 from app.schemas.agent import AgentCreate, AgentResponse, AgentWithKey
@@ -81,10 +81,13 @@ def list_agents(
     limit: int = 100,
     environment: str = None,
     db: Session = Depends(get_db),
-    _: str = Depends(require_admin)
+    ctx: AdminContext = Depends(get_admin_context),
 ):
     """
-    List all agents (Admin only)
+    List all agents (Admin only).
+
+    Auditors and above are accepted. Results are automatically scoped to the
+    caller's team when ``ctx.team`` is set (non-null).
 
     Query parameters:
     - skip: Number of records to skip
@@ -92,6 +95,9 @@ def list_agents(
     - environment: Filter by environment (dev/stage/prod)
     """
     query = db.query(Agent).filter(Agent.is_active == True)
+
+    if ctx.team:
+        query = query.filter(Agent.owner_team == ctx.team)
 
     if environment:
         query = query.filter(Agent.environment == environment)

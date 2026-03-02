@@ -6,18 +6,24 @@ Simulates a LangGraph-style web research + database update pipeline
 with AgentGuard governance checks at every step.
 
 Usage:
-    python demo_agent.py                        # 1 run, first topic
-    python demo_agent.py --loop 3               # 3 runs, different topics
-    python demo_agent.py --topic "quantum AI"   # custom topic, 1 run
-    python demo_agent.py --topic "LLMs" --loop 2
+    python demo_agent.py                             # normal flow (1 run)
+    python demo_agent.py --loop 3                    # 3 runs, different topics
+    python demo_agent.py --topic "quantum AI"        # custom topic
+    python demo_agent.py --scenario approval         # HITL approval demo
+    python demo_agent.py --scenario approval --loop 2
 
-Demo flow per run:
-    Step 1 → enforce("search:web")       → AgentGuard decides
-    Step 2 → [mock] execute web search
-    Step 3 → enforce("write:database")   → AgentGuard decides
-    Step 4 → [mock] write to DB          → (or blocked)
+Demo flows:
+  normal   — Steps 1-4: enforce search → search → enforce write → write to DB
+  approval — Steps 1-4 as above, then Step 5: enforce delete:database →
+             AgentGuard returns 'pending' → agent waits for human approval
+             at http://localhost:3000/approvals → continues or aborts based
+             on the human decision.
+
+Pre-requisites for --scenario approval:
+    python demo_setup.py --with-approval   # sets require_approval rule on delete:database
 
 Watch the live audit trail at: http://localhost:3000/demo
+Watch pending approvals at:    http://localhost:3000/approvals
 """
 import argparse
 import sqlite3
@@ -60,6 +66,7 @@ if not CREDS_FILE.exists():
 creds = load_env_file(CREDS_FILE)
 AGENT_KEY   = creds.get("DEMO_AGENT_KEY", "")
 AGENT_ID    = creds.get("DEMO_AGENT_ID", "")
+ADMIN_KEY   = creds.get("DEMO_ADMIN_KEY", "")
 BACKEND_URL = creds.get("AGENTGUARD_URL", "http://localhost:8000")
 
 if not AGENT_KEY:
@@ -78,6 +85,7 @@ RED  = "\033[91m"
 YLW  = "\033[93m"
 BLU  = "\033[94m"
 CYN  = "\033[96m"
+AMB  = "\033[33m"
 DIM  = "\033[2m"
 BOLD = "\033[1m"
 RST  = "\033[0m"
@@ -137,6 +145,9 @@ def ok(msg):
 def denied(msg):
     print(f"            {RED}✗{RST}  {msg}")
 
+def pending_msg(msg):
+    print(f"            {AMB}⏳{RST}  {msg}")
+
 def info(msg):
     print(f"            {BLU}→{RST}  {msg}")
 
@@ -179,6 +190,16 @@ def write_research_findings(run_id: str, topic: str, results: list) -> int:
     return count
 
 
+def delete_old_research_findings(run_id: str) -> int:
+    """Delete rows for a specific run_id (mocked cleanup). Returns deleted count."""
+    conn = sqlite3.connect(RESEARCH_DB_FILE)
+    cur = conn.execute("DELETE FROM research_findings WHERE run_id = ?", (run_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+
 def count_research_findings() -> int:
     if not RESEARCH_DB_FILE.exists():
         return 0
@@ -188,9 +209,49 @@ def count_research_findings() -> int:
     return count
 
 
+# ── approval waiting display ──────────────────────────────────────────────────
+
+SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+def wait_with_spinner(client: "AgentGuardClient", approval_id: str, timeout: int = 300):
+    """
+    Poll for approval with an animated spinner using agent auth.
+    Returns the final approval dict once a decision is made.
+    Raises TimeoutError after `timeout` seconds.
+    """
+    deadline = time.time() + timeout
+    frame    = 0
+    poll_interval = 3
+
+    print()
+    while time.time() < deadline:
+        elapsed = int(time.time() - (deadline - timeout))
+        spin    = SPINNER[frame % len(SPINNER)]
+        line    = f"            {AMB}{spin}{RST}  Waiting for human decision… ({elapsed}s)"
+        print(line, end="\r", flush=True)
+        frame += 1
+
+        try:
+            # Use agent auth — agents can poll their own approvals without admin creds
+            approval = client.poll_approval(approval_id)
+            if approval["status"] != "pending":
+                print(" " * 70, end="\r")  # clear spinner line
+                return approval
+        except Exception as e:
+            # Transient errors (network blip) — log briefly and keep polling
+            print(" " * 70, end="\r")
+            print(f"            {DIM}[poll error: {e}]{RST}", end="\r", flush=True)
+
+        time.sleep(poll_interval)
+
+    print(" " * 70, end="\r")
+    raise TimeoutError(f"No decision within {timeout}s — still pending in the queue.")
+
+
 # ── agent pipeline ────────────────────────────────────────────────────────────
 
-def run_agent(client: AgentGuardClient, topic: str, run_num: int):
+def run_agent(client: "AgentGuardClient", topic: str, run_num: int):
+    """Standard pipeline: search → write to DB."""
     run_id = str(uuid.uuid4())[:8]
     ctx    = {"run_id": run_id, "topic": topic, "agent": "WebResearchBot"}
 
@@ -295,6 +356,223 @@ def run_agent(client: AgentGuardClient, topic: str, run_num: int):
     print(f"  {GRN}  └{'─' * 52}┘{RST}")
 
 
+def run_agent_with_approval(client: "AgentGuardClient", topic: str, run_num: int):
+    """
+    Extended pipeline that adds Step 5: delete:database requiring human approval.
+
+    Demonstrates the Human-in-the-Loop (HITL) governance checkpoint:
+      1. Agent attempts to clean up old research rows
+      2. AgentGuard returns status='pending' + approval_id
+      3. Agent waits (spinner) while a human reviews the request
+      4. Human approves → agent proceeds; Human denies → agent aborts
+
+    Requires the demo policy to have a require_approval rule for delete:database.
+    Run  python demo_setup.py --with-approval  to configure this.
+    """
+    if not ADMIN_KEY:
+        print(f"\n  {RED}[ERROR]{RST}  DEMO_ADMIN_KEY not found in {CREDS_FILE}")
+        print("  Re-run:  python demo_setup.py --with-approval")
+        print("  (This saves the admin key so the agent can poll approval status.)")
+        sys.exit(1)
+
+    run_id = str(uuid.uuid4())[:8]
+    ctx    = {"run_id": run_id, "topic": topic, "agent": "WebResearchBot", "scenario": "approval"}
+
+    print()
+    print(f"  {'═' * 60}")
+    print(f"  {BOLD}  WebResearchBot  —  HITL Approval Demo  —  Run #{run_num}{RST}")
+    print(f"  {YLW}  Topic  :{RST}  {topic}")
+    print(f"  {DIM}  Run ID :  {run_id}{RST}")
+    print(f"  {'═' * 60}")
+
+    # ── STEP 1: enforce search:web ────────────────────────────────────────────
+    section("STEP 1  ·  Permission check  →  search:web")
+    info("Action   :  search:web")
+    info(f"Resource :  {topic}")
+    info("Asking AgentGuard …")
+    time.sleep(0.5)
+
+    d1 = client.enforce(action="search:web", resource=topic, context={**ctx, "step": 1})
+
+    if not d1["allowed"]:
+        denied(f"DENIED  —  {d1['reason']}")
+        client.log_action(action="search:web", resource=topic, allowed=False, result="error",
+                          context=ctx, metadata={"step": 1})
+        print(f"\n  {YLW}  Agent halted.{RST}")
+        return
+
+    ok(f"ALLOWED  —  {d1['reason']}")
+    client.log_action(action="search:web", resource=topic, allowed=True, result="success",
+                      context=ctx, metadata={"step": 1})
+
+    # ── STEP 2: web search ────────────────────────────────────────────────────
+    section("STEP 2  ·  Executing web search")
+    info(f"Searching: {topic}")
+    time.sleep(0.9)
+    results = MOCK_RESULTS.get(topic, _DEFAULT_RESULTS(topic))
+    ok(f"Found {len(results)} results")
+    for r in results:
+        dim(f"• [{r['score']:.0%}]  {r['title']}  ({r['source']})")
+
+    # ── STEP 3: enforce write:database ────────────────────────────────────────
+    section("STEP 3  ·  Permission check  →  write:database")
+    info("Action   :  write:database")
+    info("Resource :  research_findings")
+    info("Asking AgentGuard …")
+    time.sleep(0.5)
+
+    d2 = client.enforce(action="write:database", resource="research_findings",
+                        context={**ctx, "step": 3})
+
+    if d2["status"] == "pending":
+        # write:database requires approval (policy may have it in require_approval)
+        approval_id = d2["approval_id"]
+        pending_msg(f"PENDING  —  Approval required!")
+        info(f"Approval ID :  {approval_id}")
+        print()
+        print(f"  {AMB}  ┌{'─' * 58}┐{RST}")
+        print(f"  {AMB}  │  A human must approve this action before it proceeds.  │{RST}")
+        print(f"  {AMB}  │                                                         │{RST}")
+        print(f"  {AMB}  │  Open:  http://localhost:3000/approvals                 │{RST}")
+        print(f"  {AMB}  │  Click Approve or Deny for the pending request.         │{RST}")
+        print(f"  {AMB}  └{'─' * 58}┘{RST}")
+        try:
+            final = wait_with_spinner(client, approval_id, timeout=300)
+        except TimeoutError:
+            print()
+            pending_msg("Timed out after 5 minutes — request still pending in the queue.")
+            client.log_action(action="write:database", resource="research_findings",
+                              allowed=False, result="error", context=ctx,
+                              metadata={"step": 3, "approval_id": approval_id, "outcome": "timeout"})
+            return
+        if final["status"] == "approved":
+            decision_by = final.get("decision_by", "admin")
+            print()
+            ok(f"APPROVED by {decision_by} — proceeding with DB write")
+            client.log_action(action="write:database", resource="research_findings",
+                              allowed=True, result="success", context=ctx,
+                              metadata={"step": 3, "approved_by": decision_by, "approval_id": approval_id})
+        else:
+            decision_by = final.get("decision_by", "admin")
+            reason      = final.get("decision_reason", "")
+            print()
+            denied(f"DENIED by {decision_by}" + (f"  — \"{reason}\"" if reason else ""))
+            client.log_action(action="write:database", resource="research_findings",
+                              allowed=False, result="error", context=ctx,
+                              metadata={"step": 3, "denied_by": decision_by, "approval_id": approval_id})
+            print(f"\n  {RED}  DB write denied by human administrator.{RST}")
+            return
+    elif not d2["allowed"]:
+        denied(f"DENIED  —  {d2['reason']}")
+        client.log_action(action="write:database", resource="research_findings",
+                          allowed=False, result="error", context=ctx, metadata={"step": 3})
+        print(f"\n  {RED}  DB write BLOCKED.{RST}")
+        return
+    else:
+        ok(f"ALLOWED  —  {d2['reason']}")
+
+    # ── STEP 4: write results ─────────────────────────────────────────────────
+    section("STEP 4  ·  Writing to database")
+    info("Table  :  research_findings")
+    info(f"Rows   :  {len(results)}")
+    time.sleep(0.7)
+
+    total = write_research_findings(run_id, topic, results)
+    ok(f"Wrote {len(results)} rows  (run_id={run_id})")
+    ok(f"Total rows in research_findings: {total}")
+    client.log_action(action="write:database", resource="research_findings",
+                      allowed=True, result="success", context=ctx,
+                      metadata={"step": 4, "rows_written": len(results), "topic": topic})
+
+    # ── STEP 5: request approval to delete old entries ────────────────────────
+    section("STEP 5  ·  Human-in-the-Loop checkpoint  →  delete:database")
+    info("Action   :  delete:database")
+    info("Resource :  research_findings")
+    info("Context  :  routine cleanup — remove stale entries from this run")
+    info("Asking AgentGuard …")
+    time.sleep(0.5)
+
+    d3 = client.enforce(
+        action="delete:database",
+        resource="research_findings",
+        context={**ctx, "step": 5, "reason": "cleanup stale entries", "run_id": run_id},
+    )
+
+    if d3["status"] == "allowed":
+        # Shouldn't happen with the approval policy, but handle gracefully
+        ok(f"ALLOWED  —  {d3['reason']}")
+        deleted = delete_old_research_findings(run_id)
+        ok(f"Deleted {deleted} rows for run_id={run_id}")
+
+    elif d3["status"] == "pending":
+        approval_id = d3["approval_id"]
+        pending_msg(f"PENDING  —  Approval required!")
+        info(f"Approval ID :  {approval_id}")
+        print()
+        print(f"  {AMB}  ┌{'─' * 58}┐{RST}")
+        print(f"  {AMB}  │  A human must approve this action before it proceeds.  │{RST}")
+        print(f"  {AMB}  │                                                         │{RST}")
+        print(f"  {AMB}  │  Open:  http://localhost:3000/approvals                 │{RST}")
+        print(f"  {AMB}  │  Click Approve or Deny for the pending request.         │{RST}")
+        print(f"  {AMB}  └{'─' * 58}┘{RST}")
+
+        try:
+            final = wait_with_spinner(client, approval_id, timeout=300)
+        except TimeoutError:
+            print()
+            pending_msg("Timed out after 5 minutes — request still pending in the queue.")
+            client.log_action(action="delete:database", resource="research_findings",
+                              allowed=False, result="error", context=ctx,
+                              metadata={"step": 5, "approval_id": approval_id, "outcome": "timeout"})
+            return
+
+        if final["status"] == "approved":
+            decision_by = final.get("decision_by", "admin")
+            reason      = final.get("decision_reason", "")
+            print()
+            ok(f"APPROVED by {decision_by}" + (f"  — \"{reason}\"" if reason else ""))
+            section("STEP 5b  ·  Executing approved delete")
+            info(f"Removing stale entries for run_id={run_id}…")
+            time.sleep(0.5)
+            deleted = delete_old_research_findings(run_id)
+            ok(f"Deleted {deleted} rows  (run_id={run_id})")
+            client.log_action(action="delete:database", resource="research_findings",
+                              allowed=True, result="success", context=ctx,
+                              metadata={"step": 5, "deleted_rows": deleted,
+                                        "approved_by": decision_by, "approval_id": approval_id})
+
+            print()
+            print(f"  {GRN}  ┌{'─' * 58}┐{RST}")
+            print(f"  {GRN}  │  Run complete — HITL approval checkpoint passed  ✓   │{RST}")
+            print(f"  {GRN}  │  {len(results)} rows written, {deleted} stale rows cleaned up          │{RST}")
+            print(f"  {GRN}  └{'─' * 58}┘{RST}")
+
+        else:  # denied
+            decision_by = final.get("decision_by", "admin")
+            reason      = final.get("decision_reason", "")
+            print()
+            denied(f"DENIED by {decision_by}" + (f"  — \"{reason}\"" if reason else ""))
+            client.log_action(action="delete:database", resource="research_findings",
+                              allowed=False, result="error", context=ctx,
+                              metadata={"step": 5, "denied_by": decision_by,
+                                        "decision_reason": reason, "approval_id": approval_id})
+
+            print()
+            print(f"  {RED}  ┌{'─' * 58}┐{RST}")
+            print(f"  {RED}  │  Delete denied by human administrator             ✗   │{RST}")
+            print(f"  {RED}  │  Research data preserved — governance enforced        │{RST}")
+            print(f"  {RED}  └{'─' * 58}┘{RST}")
+
+    else:
+        # outright denied by policy (no require_approval rule set up)
+        denied(f"DENIED  —  {d3['reason']}")
+        print()
+        print(f"  {YLW}  Hint: run  python demo_setup.py --with-approval  to enable HITL.{RST}")
+        client.log_action(action="delete:database", resource="research_findings",
+                          allowed=False, result="error", context=ctx,
+                          metadata={"step": 5, "reason": d3["reason"]})
+
+
 # ── entrypoint ────────────────────────────────────────────────────────────────
 
 def main():
@@ -305,19 +583,30 @@ def main():
                         help="Research topic override")
     parser.add_argument("--loop",  type=int, default=1,
                         help="Number of agent runs (default: 1)")
+    parser.add_argument("--scenario", default="normal",
+                        choices=["normal", "approval"],
+                        help="Demo scenario: 'normal' (default) or 'approval' (HITL demo)")
     args = parser.parse_args()
 
     init_research_db()
 
     print()
     print(f"  {BOLD}AgentGuard  ·  WebResearchBot Demo{RST}")
-    print(f"  {DIM}Backend  : {BACKEND_URL}{RST}")
-    print(f"  {DIM}Agent    : {AGENT_ID}{RST}")
-    print(f"  {DIM}Live UI  : http://localhost:3000/demo{RST}")
+    print(f"  {DIM}Backend     : {BACKEND_URL}{RST}")
+    print(f"  {DIM}Agent       : {AGENT_ID}{RST}")
+    print(f"  {DIM}Scenario    : {args.scenario}{RST}")
+    print(f"  {DIM}Live UI     : http://localhost:3000/demo{RST}")
+    if args.scenario == "approval":
+        print(f"  {AMB}  Approvals : http://localhost:3000/approvals{RST}")
     print(f"  {DIM}Research DB : {RESEARCH_DB_FILE}{RST}")
     print(f"  {DIM}Existing rows in research_findings: {count_research_findings()}{RST}")
 
-    client = AgentGuardClient(base_url=BACKEND_URL, agent_key=AGENT_KEY)
+    # Build client — approval scenario needs admin_key for polling approval status
+    client = AgentGuardClient(
+        base_url=BACKEND_URL,
+        agent_key=AGENT_KEY,
+        admin_key=ADMIN_KEY if ADMIN_KEY else None,
+    )
 
     if args.topic:
         topics = [args.topic] * args.loop
@@ -325,7 +614,10 @@ def main():
         topics = (TOPICS * ((args.loop // len(TOPICS)) + 1))[:args.loop]
 
     for i, topic in enumerate(topics, 1):
-        run_agent(client, topic, i)
+        if args.scenario == "approval":
+            run_agent_with_approval(client, topic, i)
+        else:
+            run_agent(client, topic, i)
         if i < len(topics):
             print(f"\n  {DIM}  Next run in 3 seconds…{RST}")
             time.sleep(3)
@@ -334,6 +626,9 @@ def main():
     print(f"  {'─' * 56}")
     print(f"  {BLU}  View full audit trail at:{RST}")
     print(f"  {BLU}  http://localhost:3000/demo{RST}")
+    if args.scenario == "approval":
+        print(f"  {BLU}  View approvals at:{RST}")
+        print(f"  {BLU}  http://localhost:3000/approvals{RST}")
     print(f"  {'─' * 56}")
     print()
 

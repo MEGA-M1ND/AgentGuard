@@ -2,49 +2,73 @@
 
 **Identity + Permissions + Audit Logs control plane for AI agents.**
 
-AgentGuard provides enterprises with visibility and control over AI agent actions through:
-- **Agent Identity**: Manage AI agents with unique identities and API keys
-- **Permission Scopes**: Define allow/deny policies for agent actions
-- **Audit Logs**: Append-only tamper-evident logs of all agent activities
-- **Dashboard**: Minimal UI to view and filter audit logs
-- **Python SDK**: Easy integration for your AI agents
+AgentGuard is an enterprise-grade governance layer for AI agents. It gives teams full visibility and control over what AI agents can do, enforces policies in real time, and creates a tamper-evident audit trail of every action.
 
-## 🚀 Production-Ready Features
+## Features
 
-AgentGuard is **production-ready** with enterprise-grade capabilities:
-- ⚡ **Rate Limiting** - Protect against abuse (1000 req/min per agent)
-- 📊 **Prometheus Metrics** - Full observability with 10+ metrics
-- 🏥 **Health Checks** - Kubernetes-ready probes (`/health/ready`, `/health/live`)
-- 📝 **Structured Logging** - JSON logs with correlation IDs
-- 🔌 **Connection Pooling** - Efficient database resource management
-- 🚨 **Alerting Rules** - Pre-configured Prometheus alerts
-- 🔐 **Security Hardening** - Rate limits, error handling, secrets management
+### Core
+- **Agent Identity** — Manage AI agents with unique IDs and scoped API keys
+- **Policy Engine** — Allow/deny/require-approval rules with wildcard matching and a default-deny posture
+- **Audit Logging** — Append-only, cryptographically chained logs of all agent actions
+- **Python SDK** — Transparent integration; agents check in with one function call
 
-**📖 Deploy to Production**: See [PRODUCTION.md](PRODUCTION.md) | [Production Checklist](PRODUCTION_CHECKLIST.md) | [Production Features](PRODUCTION_FEATURES.md)
+### Security
+- **JWT Authentication** — RS256 signed tokens with automatic key rotation, 1h agent / 8h admin TTL
+- **Token Revocation** — Per-token JTI revocation list; `POST /token/revoke`
+- **JWKS Endpoint** — `GET /.well-known/jwks.json` for third-party token verification
+- **Cryptographic Audit Chain** — Per-agent SHA-256 hash chain; tamper detection via `GET /logs/verify`
+
+### Access Control
+- **RBAC** — Four roles: `super-admin > admin > auditor > approver`
+- **Named Admin Users** — Registered users with hashed keys and role/team scoping
+- **Team Policies** — Per-team deny/allow/approval rules that merge with agent policies
+- **Conditional Rules** — Policy rules can carry `conditions: {env, time_range, day_of_week}` guards
+
+### Workflow
+- **Human-in-the-Loop (HITL)** — `require_approval` policy rules pause agent actions until a human decides
+- **Webhook Notifications** — HTTP POST on `approval.created/approved/denied`; Slack-ready with HMAC signing
+- **AI-Assisted Policy Creation** — Generate a starter policy from a natural-language description
+
+### Observability
+- **Compliance Reports** — Period-based dashboard: daily activity, approval funnel, top agents, top denied actions
+- **Prometheus Metrics** — 10+ metrics, pre-configured alert rules
+- **Health Checks** — Kubernetes-ready `/health/ready` and `/health/live` probes
+- **Structured Logging** — JSON logs with correlation IDs
+
+### Developer Experience
+- **Policy Templates** — Six built-in archetypes (read-only, research, data-analyst, devops, customer-support, full-access-dev)
+- **Policy Playground** — Test rules against sample actions before deploying
+- **Action Normalization** — Write actions as `read:file`, `read file`, `Read File`, `read-file` — all equivalent
+- **Rate Limiting** — 1 000 req/min per agent (SlowAPI)
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-┌─────────────┐
-│  AI Agent   │
-│  (w/ SDK)   │
-└──────┬──────┘
-       │ X-AGENT-KEY
-       ▼
-┌─────────────────────────────────┐
-│      AgentGuard Backend         │
-│  ┌──────────┐  ┌─────────────┐ │
-│  │  Enforce │  │ Audit Logs  │ │
-│  │  Policy  │  │  (append)   │ │
-│  └──────────┘  └─────────────┘ │
-└─────────────────────────────────┘
-       ▲
-       │
-┌──────┴──────┐
-│ Admin APIs  │ (X-ADMIN-KEY)
-└─────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  AI Agents (Python SDK)                                  │
+│  agentguard.enforce() → agentguard.log_action()          │
+└────────────────────┬─────────────────────────────────────┘
+                     │  Bearer <JWT>  (or X-Agent-Key)
+                     ▼
+┌──────────────────────────────────────────────────────────┐
+│  AgentGuard Backend  (FastAPI)                           │
+│                                                          │
+│  ┌────────────┐  ┌────────────┐  ┌────────────────────┐ │
+│  │  Enforce   │  │ Approvals  │  │  Audit Logs        │ │
+│  │  + Teams   │  │ + Webhooks │  │  (SHA-256 chain)   │ │
+│  └────────────┘  └────────────┘  └────────────────────┘ │
+│  ┌────────────┐  ┌────────────┐  ┌────────────────────┐ │
+│  │  RBAC /    │  │  JWT /     │  │  Reports /         │ │
+│  │  Admin     │  │  JWKS      │  │  Prometheus        │ │
+│  └────────────┘  └────────────┘  └────────────────────┘ │
+└──────────────────────────────────────────────────────────┘
+                     ▲
+                     │  Bearer <JWT>  (or X-Admin-Key)
+┌────────────────────┴─────────────────────────────────────┐
+│  Admin Clients / UI Dashboard (Next.js)                  │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -67,12 +91,9 @@ make up
 
 # Run migrations
 make migrate
-
-# Check status
-make ps
 ```
 
-Services will be available at:
+Services:
 - Backend API: http://localhost:8000
 - UI Dashboard: http://localhost:3000
 - PostgreSQL: localhost:5432
@@ -83,193 +104,186 @@ Services will be available at:
 export ADMIN_API_KEY="admin-secret-key-change-in-production"
 ```
 
-### 3. Run Quickstart Demo
+### 3. Run Demo
 
 ```bash
 cd sdk
-pip install -e .
-python examples/quickstart.py
+
+# Normal scenario (allow/deny/log pipeline)
+python examples/demo_setup.py
+python examples/demo_agent.py
+
+# HITL scenario (approval checkpoint)
+python examples/demo_setup.py --with-approval
+python examples/demo_agent.py --scenario approval
+# Open http://localhost:3000/approvals and click Approve or Deny
 ```
-
-This will:
-1. Create an agent
-2. Set a policy (allow `read:file`, deny `delete:*`)
-3. Test enforcement
-4. Submit audit logs
-5. Query logs
-
-### 4. View in Dashboard
-
-Open http://localhost:3000 to see audit logs with filters.
 
 ---
 
 ## Authentication
 
-AgentGuard uses two authentication levels:
+AgentGuard supports two auth modes — JWT (preferred) and static API key headers (legacy).
 
-### Admin Authentication
-Used for management operations (create agents, set policies)
-```
-X-ADMIN-KEY: <your-admin-key>
-```
+### JWT — Preferred
 
-Set via environment variable:
 ```bash
-ADMIN_API_KEY=your-secret-admin-key
+# Exchange a static key for a JWT
+POST /token
+{"agent_key": "agk_xxx"}          # → agent token (1h)
+{"admin_key": "your-admin-key"}   # → admin token (8h)
+
+# Use the token
+Authorization: Bearer <jwt>
 ```
 
-### Agent Authentication
-Used by agents for enforcement and log submission
-```
-X-AGENT-KEY: <agent-api-key>
+Token claims: `sub`, `jti`, `iat`, `exp`, `type` (`agent`|`admin`), `env`, `team`, `role` (admin only).
+
+Revoke a token:
+```bash
+POST /token/revoke
+Authorization: Bearer <jwt>
 ```
 
-API keys are:
-- Generated automatically when creating an agent
-- Stored hashed (SHA256) in database
-- Never logged in plaintext
+JWKS for third-party verification: `GET /.well-known/jwks.json`
+
+### Static Key Headers — Legacy
+
+```
+X-ADMIN-KEY: <admin-key>      # admin operations
+X-AGENT-KEY: <agent-api-key>  # agent operations
+```
+
+Both modes are accepted on every endpoint for backward compatibility.
 
 ---
 
 ## API Reference
 
-### Agent Management (Admin)
+### Token Endpoints
 
-#### Create Agent
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/token` | Exchange static key → JWT |
+| `POST` | `/token/revoke` | Revoke a JWT by JTI |
+| `GET`  | `/.well-known/jwks.json` | Public key set (RS256) |
+
+### Agent Management
+
+| Method | Path | Auth |
+|--------|------|------|
+| `POST` | `/agents` | Admin |
+| `GET`  | `/agents` | Admin |
+| `GET`  | `/agents/{id}` | Admin |
+| `DELETE` | `/agents/{id}` | Admin |
+
 ```bash
 POST /agents
-X-ADMIN-KEY: <admin-key>
-
-{
-  "name": "support-bot",
-  "owner_team": "customer-success",
-  "environment": "prod"
-}
-
-Response:
-{
-  "agent_id": "agt_abc123",
-  "api_key": "agk_xyz789..."  # Only shown once!
-}
+{"name": "support-bot", "owner_team": "customer-success", "environment": "prod"}
+# Returns: {"agent_id": "agt_abc123", "api_key": "agk_xyz789..."}  ← shown once
 ```
 
-#### List Agents
-```bash
-GET /agents
-X-ADMIN-KEY: <admin-key>
-```
+### Policy Management
 
-#### Get Agent
-```bash
-GET /agents/{agent_id}
-X-ADMIN-KEY: <admin-key>
-```
+| Method | Path | Description |
+|--------|------|-------------|
+| `PUT`  | `/agents/{id}/policy` | Set agent policy |
+| `GET`  | `/agents/{id}/policy` | Get agent policy |
+| `POST` | `/agents/{id}/policy/generate` | AI-generate starter policy |
+| `GET`  | `/policy-templates` | List built-in templates |
 
-#### Delete Agent
-```bash
-DELETE /agents/{agent_id}
-X-ADMIN-KEY: <admin-key>
-```
-
-### Policy Management (Admin)
-
-#### Set Policy
-```bash
-PUT /agents/{agent_id}/policy
-X-ADMIN-KEY: <admin-key>
-
-{
-  "allow": [
-    {"action": "read:file", "resource": "s3://docs/*"},
-    {"action": "call:internal_api", "resource": "api.internal.com/v1/*"}
-  ],
-  "deny": [
-    {"action": "delete:*", "resource": "*"},
-    {"action": "send:external_email", "resource": "*"}
-  ]
-}
-```
-
-#### Action Format - Type Naturally! ✨
-
-AgentGuard intelligently parses action patterns, so you can type them in any format you prefer. All of these work the same:
-
-| Format | Example | Description |
-|--------|---------|-------------|
-| **Standard** | `read:file` | Traditional verb:noun pattern |
-| **Natural** | `read file` | Space-separated (easiest!) |
-| **Capitalized** | `Read File` | Natural with capitals |
-| **Hyphenated** | `read-file` | Kebab-case |
-| **Snake case** | `read_file` | Underscore-separated |
-| **CamelCase** | `readFile` | No spaces |
-
-**Real Examples:**
+**Policy rule format:**
 ```json
 {
   "allow": [
-    {"action": "read file", "resource": "*.txt"},
-    {"action": "Send Email", "resource": "*"},
-    {"action": "query database", "resource": "users_table"},
-    {"action": "delete *", "resource": "temp/*"}
+    {"action": "read:file", "resource": "s3://docs/*"},
+    {"action": "search:web", "resource": "*",
+     "conditions": {"env": "prod", "time_range": {"start": "09:00", "end": "18:00"}}}
+  ],
+  "deny": [
+    {"action": "delete:*", "resource": "*"}
+  ],
+  "require_approval": [
+    {"action": "write:database", "resource": "users"}
   ]
 }
 ```
 
-All actions are automatically normalized to lowercase `verb:noun` format internally (e.g., `"Read File"` → `"read:file"`).
+**Conditions** (all AND-ed):
+- `env` — matches agent environment field
+- `time_range` — `{"start": "HH:MM", "end": "HH:MM"}` (UTC)
+- `day_of_week` — list of day names, e.g. `["Monday", "Tuesday"]`
 
-**Wildcards:**
-- `read:*` or `read *` - Matches any read action
-- `*:file` or `* file` - Matches any action on files
-- `*` - Matches everything (use with caution!)
-
-#### Get Policy
-```bash
-GET /agents/{agent_id}/policy
-X-ADMIN-KEY: <admin-key>
+**Action format** — all of these are equivalent:
+```
+read:file  |  read file  |  Read File  |  read-file  |  read_file  |  readFile
 ```
 
-### Enforcement (Agent)
+### Enforcement
 
-#### Check Permission
 ```bash
 POST /enforce
-X-AGENT-KEY: <agent-key>
+Authorization: Bearer <agent-jwt>
 
-{
-  "action": "read:file",
-  "resource": "s3://docs/invoice.pdf",
-  "context": {"user_id": "usr_123"}
-}
+{"action": "read:file", "resource": "invoice.pdf", "context": {"user_id": "u1"}}
 
-Response:
-{
-  "allowed": true,
-  "reason": "Matched allow rule: read:file on s3://docs/*"
-}
+# Response — allowed
+{"allowed": true, "reason": "Matched allow rule: read:file on s3://docs/*"}
+
+# Response — pending approval
+{"allowed": false, "status": "pending", "approval_id": "ap_xxxxxxxx..."}
 ```
 
-### Audit Logs (Agent)
+### Audit Logs
 
-#### Submit Log
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/logs` | Submit a log entry |
+| `GET`  | `/logs` | Query logs (agent\_id, action, allowed, start\_time, limit) |
+| `GET`  | `/logs/verify?agent_id=xxx` | Verify per-agent SHA-256 chain |
+
 ```bash
-POST /logs
-X-AGENT-KEY: <agent-key>
-
-{
-  "action": "read:file",
-  "resource": "s3://docs/invoice.pdf",
-  "context": {"user_id": "usr_123"},
-  "allowed": true,
-  "result": "success",
-  "metadata": {"bytes_read": 1024}
-}
+GET /logs/verify?agent_id=agt_abc123
+# Returns: {"valid": true, "total_entries": 42, "broken_at": null}
 ```
 
-#### Query Logs
+### Approvals (Human-in-the-Loop)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`  | `/approvals` | List pending/all approvals |
+| `GET`  | `/approvals/{id}` | Get approval status (agent polls this) |
+| `POST` | `/approvals/{id}/approve` | Approve with optional reason |
+| `POST` | `/approvals/{id}/deny` | Deny with optional reason |
+
+### Admin Users & RBAC
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/admin/users` | Create named admin user |
+| `GET`  | `/admin/users` | List admin users |
+| `DELETE` | `/admin/users/{id}` | Delete admin user |
+| `PUT`  | `/teams/{team}/policy` | Set team-level policy |
+| `GET`  | `/teams/{team}/policy` | Get team policy |
+
+Roles (highest to lowest): `super-admin (4)` › `admin (3)` › `auditor (2)` › `approver (1)`
+
+Team policies merge with agent policies: team deny rules fire first (highest priority).
+
+### Reports
+
 ```bash
-GET /logs?agent_id=agt_abc123&action=read:file&allowed=true&start_time=2024-01-01T00:00:00Z&limit=100
-X-AGENT-KEY: <agent-key> or X-ADMIN-KEY: <admin-key>
+GET /reports/summary?days=30
+Authorization: Bearer <admin-jwt>
+
+# Returns:
+{
+  "overview":  {"total_actions", "allowed", "denied", "allow_rate", "deny_rate"},
+  "approvals": {"total", "pending", "approved", "denied", "approval_rate"},
+  "top_agents": [...],
+  "top_denied_actions": [...],
+  "daily_breakdown": [...]
+}
 ```
 
 ---
@@ -287,108 +301,35 @@ pip install agentguard
 ```python
 from agentguard import AgentGuardClient
 
-# Admin client
-admin = AgentGuardClient(
-    base_url="http://localhost:8000",
-    admin_key="your-admin-key"
-)
+# Admin client — static key auto-exchanged for JWT internally
+admin = AgentGuardClient(base_url="http://localhost:8000", admin_key="your-admin-key")
 
 # Create agent
-agent = admin.create_agent(
-    name="my-agent",
-    owner_team="engineering",
-    environment="prod"
-)
-print(f"Agent ID: {agent['agent_id']}")
-print(f"API Key: {agent['api_key']}")  # Save this!
+agent = admin.create_agent(name="my-agent", owner_team="engineering", environment="prod")
+agent_key = agent["api_key"]  # save this
 
 # Set policy
 admin.set_policy(
-    agent_id=agent['agent_id'],
-    allow=[
-        {"action": "read:file", "resource": "*"}
-    ],
-    deny=[
-        {"action": "delete:*", "resource": "*"}
-    ]
+    agent_id=agent["agent_id"],
+    allow=[{"action": "read:file", "resource": "*"}],
+    deny=[{"action": "delete:*", "resource": "*"}],
+    require_approval=[{"action": "write:database", "resource": "users"}],
 )
 
 # Agent client
-client = AgentGuardClient(
-    base_url="http://localhost:8000",
-    agent_key=agent['api_key']
-)
+client = AgentGuardClient(base_url="http://localhost:8000", agent_key=agent_key)
 
-# Check permission
-result = client.enforce(
-    action="read:file",
-    resource="invoice.pdf"
-)
-if result['allowed']:
-    # Perform action
-    client.log_action(
-        action="read:file",
-        resource="invoice.pdf",
-        allowed=True,
-        result="success"
-    )
+# Check permission + log
+result = client.enforce(action="read:file", resource="invoice.pdf")
+if result["allowed"]:
+    client.log_action(action="read:file", resource="invoice.pdf", allowed=True, result="success")
+elif result.get("status") == "pending":
+    # Poll until human decides
+    approval_id = result["approval_id"]
+    decision = client.poll_approval(approval_id)   # blocks with spinner in demo
 ```
 
----
-
-## Development
-
-### Setup Local Environment
-
-```bash
-# Install backend dependencies
-cd backend
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-
-# Install SDK for development
-cd ../sdk
-pip install -e .
-
-# Install UI dependencies
-cd ../ui
-npm install
-```
-
-### Run Tests
-
-```bash
-# Backend tests
-make test
-
-# Or directly
-cd backend
-pytest -v
-```
-
-### Database Migrations
-
-```bash
-# Create new migration
-make migration MSG="add_new_field"
-
-# Apply migrations
-make migrate
-
-# Rollback
-make rollback
-```
-
-### Code Quality
-
-```bash
-# Format code
-make format
-
-# Lint
-make lint
-```
+The SDK transparently exchanges static keys for JWTs on first use, caches them, and refreshes 60 s before expiry.
 
 ---
 
@@ -396,7 +337,6 @@ make lint
 
 ### Environment Variables
 
-Backend (`.env` or docker-compose):
 ```bash
 # Database
 DATABASE_URL=postgresql://agentguard:password@localhost:5432/agentguard
@@ -404,12 +344,17 @@ DATABASE_URL=postgresql://agentguard:password@localhost:5432/agentguard
 # Auth
 ADMIN_API_KEY=your-secret-admin-key-change-me
 
+# JWT (auto-generated RS256 keypair if absent, warn in logs)
+JWT_PRIVATE_KEY=<PEM-encoded RSA private key>
+
+# Webhooks (optional)
+WEBHOOK_URL=https://hooks.slack.com/services/T.../B.../xxx
+WEBHOOK_SECRET=my-hmac-signing-secret
+
 # Server
 HOST=0.0.0.0
 PORT=8000
 LOG_LEVEL=INFO
-
-# CORS (for UI dev)
 CORS_ORIGINS=http://localhost:3000
 ```
 
@@ -418,71 +363,47 @@ UI (`.env.local`):
 NEXT_PUBLIC_API_URL=http://localhost:8000
 ```
 
+### Webhook Notifications
+
+AgentGuard fires webhook events on approval lifecycle:
+
+| Event | Trigger |
+|-------|---------|
+| `approval.created` | An agent action triggers a `require_approval` rule |
+| `approval.approved` | A human approves the request |
+| `approval.denied` | A human denies the request |
+
+Requests are signed with `X-AgentGuard-Signature: sha256=<hmac>` when `WEBHOOK_SECRET` is set.
+Slack incoming webhook URLs are auto-detected and receive formatted Slack messages.
+
 ---
 
 ## Database Schema
 
-### agents
-- `id` (PK)
-- `agent_id` (unique, indexed, e.g., "agt_abc123")
-- `name`
-- `owner_team`
-- `environment` (dev/stage/prod)
-- `is_active`
-- `created_at`
-- `updated_at`
+### Core tables
+- **agents** — identity, team, environment, is_active
+- **agent_keys** — key_hash (SHA256), key_prefix, is_active
+- **policies** — allow_rules / deny_rules / require_approval_rules (JSONB)
+- **audit_logs** — log_id (UUID), chain_hash (SHA-256), prev_log_id, action, resource, context, allowed, result
 
-### agent_keys
-- `id` (PK)
-- `agent_id` (FK → agents)
-- `key_hash` (SHA256 hash)
-- `key_prefix` (first 8 chars for identification)
-- `is_active`
-- `created_at`
-
-### policies
-- `id` (PK)
-- `agent_id` (FK → agents, unique)
-- `allow_rules` (JSONB)
-- `deny_rules` (JSONB)
-- `created_at`
-- `updated_at`
-
-### audit_logs
-- `id` (PK)
-- `log_id` (UUID, unique, indexed)
-- `agent_id` (indexed)
-- `timestamp` (indexed)
-- `action` (indexed)
-- `resource`
-- `context` (JSONB)
-- `allowed` (boolean, indexed)
-- `result` (success/error)
-- `metadata` (JSONB)
-- `request_id` (UUID)
+### Extended tables
+- **approval_requests** — action, resource, context, status, decision_by, decision_reason
+- **admin_users** — name, key_hash, role, team
+- **revoked_tokens** — jti, revoked_at
+- **team_policies** — team, deny_rules / allow_rules / require_approval_rules (JSONB)
 
 ---
 
-## MVP Threat Model Notes
+## Production Deployment
 
-**What This MVP Protects Against:**
-- Unauthorized agent actions (via policy enforcement)
-- Visibility gaps (comprehensive audit logs)
-- API key theft detection (via audit patterns)
+See [PRODUCTION.md](PRODUCTION.md) | [Production Checklist](PRODUCTION_CHECKLIST.md) | [Production Features](PRODUCTION_FEATURES.md)
 
-**What This MVP Does NOT Protect Against (Future Work):**
-- API key brute force (no rate limiting yet)
-- Database tampering (no cryptographic log verification)
-- Replay attacks (no timestamp validation)
-- Advanced RBAC (single admin role only)
-
-**Production Hardening Required:**
-- Use secrets manager for ADMIN_API_KEY
+Key hardening steps:
+- Use a secrets manager for `ADMIN_API_KEY` and `JWT_PRIVATE_KEY`
 - Enable TLS/HTTPS
-- Add rate limiting
-- Implement log signature verification
-- Add backup and retention policies
-- Enable database encryption at rest
+- Set `CORS_ORIGINS` to your actual UI origin
+- Configure `WEBHOOK_SECRET` for signed notifications
+- Enable database encryption at rest and backups
 
 ---
 
@@ -506,59 +427,69 @@ make clean       # Clean containers and volumes
 
 ```
 agentguard/
-├── backend/          # FastAPI backend
+├── backend/
 │   ├── app/
-│   │   ├── api/      # API routes
-│   │   ├── models/   # SQLAlchemy models
-│   │   ├── schemas/  # Pydantic schemas
-│   │   └── utils/    # Auth, logging utilities
-│   ├── alembic/      # Database migrations
-│   └── tests/        # Pytest tests
-├── sdk/              # Python SDK
-│   ├── agentguard/
-│   └── examples/
-└── ui/               # Next.js dashboard
-    └── src/
+│   │   ├── api/          # agents, enforce, logs, policies, approvals,
+│   │   │                 # tokens, admin, reports, playground
+│   │   ├── models/       # SQLAlchemy models
+│   │   ├── schemas/      # Pydantic schemas
+│   │   └── utils/        # jwt_utils, chain, conditions, webhook
+│   └── alembic/          # Migrations (001–005)
+├── sdk/
+│   ├── agentguard/       # Python SDK
+│   └── examples/         # demo_agent.py, demo_setup.py
+└── ui/
+    └── src/app/          # agents, policies, logs, approvals,
+                          # reports, playground, admin
 ```
 
 ---
 
-## Roadmap (Post-MVP)
+## Roadmap
 
-- [ ] JWT authentication
-- [ ] Rate limiting
-- [ ] Webhook notifications
-- [ ] Policy templates
-- [ ] Advanced RBAC (teams, roles)
+- [x] Agent identity management
+- [x] Policy engine (allow/deny + wildcard)
+- [x] Audit logging
+- [x] Python SDK
+- [x] Rate limiting + Prometheus metrics
+- [x] Human-in-the-Loop approval checkpoints
+- [x] AI-assisted policy generation
+- [x] JWT authentication (RS256) + token revocation + JWKS
+- [x] Cryptographic audit log chaining + tamper verification
+- [x] Conditional policy rules (env / time / day-of-week)
+- [x] RBAC (super-admin / admin / auditor / approver)
+- [x] Team policies with merge semantics
+- [x] Webhook / Slack notifications
+- [x] Policy templates
+- [x] Compliance reports dashboard
+- [x] Policy playground
+- [ ] Go / JavaScript SDKs
 - [ ] Log retention policies
-- [ ] Analytics dashboard
-- [ ] Go/JS SDKs
 - [ ] Terraform provider
+- [ ] SSO / SAML integration
 
 ---
 
 ## Contributing
 
 1. Fork the repo
-2. Create feature branch (`git checkout -b feature/amazing`)
+2. Create a feature branch (`git checkout -b feature/amazing`)
 3. Run tests (`make test`)
 4. Format code (`make format`)
-5. Commit (`git commit -m 'Add amazing feature'`)
-6. Push (`git push origin feature/amazing`)
-7. Open Pull Request
+5. Commit and open a Pull Request
 
 ---
 
 ## License
 
-MIT License - see LICENSE file
+MIT License — see LICENSE file
 
 ---
 
 ## Support
 
 - Issues: https://github.com/yourorg/agentguard/issues
-- Docs: https://docs.agentguard.dev (TODO)
+- Docs: https://docs.agentguard.dev
 - Email: support@agentguard.dev
 
 ---

@@ -25,6 +25,7 @@ class Agent(Base):
     keys = relationship("AgentKey", back_populates="agent", cascade="all, delete-orphan")
     policy = relationship("Policy", back_populates="agent", uselist=False, cascade="all, delete-orphan")
     logs = relationship("AuditLog", back_populates="agent", cascade="all, delete-orphan")
+    approval_requests = relationship("ApprovalRequest", back_populates="agent", cascade="all, delete-orphan")
 
 
 class AgentKey(Base):

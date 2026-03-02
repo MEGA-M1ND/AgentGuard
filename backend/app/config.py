@@ -1,5 +1,5 @@
 """Application configuration"""
-from typing import List
+from typing import List, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
@@ -16,6 +16,13 @@ class Settings(BaseSettings):
 
     # Authentication
     ADMIN_API_KEY: str = "admin-secret-key-change-in-production"
+
+    # AI Policy Generation
+    ANTHROPIC_API_KEY: Optional[str] = None
+
+    # Webhooks (fire-and-forget notifications for approval events)
+    WEBHOOK_URL: Optional[str] = None          # Any HTTPS URL; Slack incoming webhooks auto-detected
+    WEBHOOK_SECRET: Optional[str] = None       # If set, signs body with HMAC-SHA256
 
     # Server
     HOST: str = "0.0.0.0"
@@ -46,6 +53,13 @@ class Settings(BaseSettings):
     # Security
     ENABLE_HTTPS: bool = False
     TRUST_PROXY_HEADERS: bool = False  # Set True if behind reverse proxy
+
+    # JWT Authentication
+    JWT_PRIVATE_KEY: Optional[str] = None   # RSA-2048 PEM string; auto-generated on startup if absent
+    JWT_ALGORITHM: str = "RS256"             # RS256 (RSA) or ES256 (ECDSA)
+    JWT_AGENT_EXPIRE_SECONDS: int = 3600    # 1 hour for agent tokens
+    JWT_ADMIN_EXPIRE_SECONDS: int = 28800   # 8 hours for admin tokens
+    JWT_KEY_ID: Optional[str] = None        # kid claim for key rotation tracking
 
     class Config:
         env_file = ".env"
